@@ -1,0 +1,191 @@
+import os, sqlite3, random, calendar, logging, base64, tempfile
+from datetime import datetime, timezone
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+
+logging.basicConfig(level=logging.INFO)
+TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","")
+OPENAI_API_KEY=os.getenv("OPENAI_API_KEY","")
+AI_MODEL=os.getenv("AI_MODEL","gpt-4.1-mini")
+TRANSCRIBE_MODEL=os.getenv("TRANSCRIBE_MODEL","gpt-4o-mini-transcribe")
+TTS_MODEL=os.getenv("TTS_MODEL","gpt-4o-mini-tts")
+TTS_VOICE=os.getenv("TTS_VOICE","alloy")
+ADMIN_IDS={int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x.strip().isdigit()}
+DB_PATH=os.getenv("DB_PATH","muha_ai.sqlite3")
+DAILY_LIMIT=int(os.getenv("DAILY_LIMIT","30"))
+PREMIUM_CREDITS=int(os.getenv("PREMIUM_CREDITS","5000"))
+
+BANK={
+"Matematika":[("2x+7=19. x ni toping",["5","6","7","8"],1,"2x=12, x=6."),
+("x²−9=0 yechimlari?",["3","−3","−3 va 3","0 va 9"],2,"x=±3."),
+("a₁=4, d=3 bo‘lsa a₆?",["16","19","22","25"],1,"a₆=4+5×3=19.")],
+"Fizika":[("Tezlik 12 m/s, vaqt 5 s. Masofa?",["17 m","60 m","2.4 m","120 m"],1,"s=vt=60 m."),
+("Kuch birligi?",["Joul","Vatt","Nyuton","Paskal"],2,"Kuch nyuton bilan o‘lchanadi.")],
+"Kimyo":[("Suv formulasi?",["CO₂","H₂O","O₂","NaCl"],1,"Suv — H₂O."),
+("Atom raqami nimani bildiradi?",["Neytron","Proton","Qavat","Massa"],1,"Atom raqami protonlar soni.")],
+"Biologiya":[("Fotosintez qayerda sodir bo‘ladi?",["Mitoxondriya","Xloroplast","Lizosoma","Ribosoma"],1,"Fotosintez xloroplastda sodir bo‘ladi.")],
+"Ona tili va adabiyot":[("Qaysi so‘z sifat?",["yugurdi","go‘zal","kitob","tezlik"],1,"Go‘zal — sifat."),
+("Alisher Navoiy asari?",["Xamsa","O‘tkan kunlar","Mehrobdan chayon","Kecha va kunduz"],0,"Navoiy “Xamsa” muallifi.")],
+"Tarix":[("O‘zbekiston mustaqilligi qaysi yili e’lon qilingan?",["1989","1990","1991","1992"],2,"1991-yil 31-avgustda e’lon qilingan.")],
+"Geografiya":[("O‘zbekiston poytaxti?",["Samarqand","Toshkent","Andijon","Nukus"],1,"Poytaxt — Toshkent.")],
+"Ingliz tili":[("She ___ to school every day.",["go","goes","going","gone"],1,"Present simple: she goes."),
+("Synonym of rapid?",["slow","quick","weak","late"],1,"Rapid means quick.")]
+}
+def db():
+ c=sqlite3.connect(DB_PATH)
+ c.execute("""CREATE TABLE IF NOT EXISTS users(uid INTEGER PRIMARY KEY,credits INTEGER DEFAULT 0,premium_until TEXT,daily_date TEXT,daily_used INTEGER DEFAULT 0,score INTEGER DEFAULT 0,total INTEGER DEFAULT 0)""")
+ c.execute("CREATE TABLE IF NOT EXISTS codes(code TEXT PRIMARY KEY,credits INTEGER,months INTEGER,used_by INTEGER,created_by INTEGER)")
+ c.execute("CREATE TABLE IF NOT EXISTS results(id INTEGER PRIMARY KEY,uid INTEGER,subject TEXT,correct INTEGER,total INTEGER,created_at TEXT)")
+ return c
+def active(exp):
+ try:return bool(exp and datetime.fromisoformat(exp)>datetime.now(timezone.utc))
+ except:return False
+def ensure(uid):
+ with db() as c:c.execute("INSERT OR IGNORE INTO users(uid) VALUES(?)",(uid,))
+def consume(uid):
+ ensure(uid); today=datetime.now(timezone.utc).date().isoformat()
+ with db() as c:
+  r=c.execute("SELECT credits,premium_until,daily_date,daily_used FROM users WHERE uid=?",(uid,)).fetchone()
+  credits,exp,day,used=r
+  if credits>0:
+   c.execute("UPDATE users SET credits=credits-1 WHERE uid=?",(uid,));return True
+  if active(exp):return True
+  if day!=today:day=today;used=0
+  if used>=DAILY_LIMIT:return False
+  c.execute("UPDATE users SET daily_date=?,daily_used=? WHERE uid=?",(day,used+1,uid))
+  return True
+def home():
+ return InlineKeyboardMarkup([[InlineKeyboardButton("🎓 Milliy sertifikat 2026",callback_data="subjects")],
+ [InlineKeyboardButton("📚 Fanlar",callback_data="subjects")],[InlineKeyboardButton("📊 Profil",callback_data="profile")],
+ [InlineKeyboardButton("ℹ️ Yordam",callback_data="help")],[InlineKeyboardButton("🔗 Rasmiy namunalar",callback_data="official")]])
+async def start(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+ ensure(u.effective_user.id)
+ await u.effective_message.reply_text("Assalomu alaykum! MUHA AI botiga xush kelibsiz.\\n\\n🎓 Milliy sertifikat mashq testlari\\n💬 AI chat (API kalit sozlanganda)\\n🖼 Rasm tahlili\\n🎙 Ovozdan matn va audio javob\\n\\nEslatma: testlar mashq uchun; rasmiy 2026 imtihon savollari emas.",reply_markup=home())
+async def help_cmd(u,c):
+ await u.effective_message.reply_text("Buyruqlar: /start /mode /profile /reset /usage /makecode 5000 5 /redeem KOD\\nRasm yuborsangiz tahlil qilaman, ovoz yuborsangiz matnga aylantirishga urinaman. AI uchun OPENAI_API_KEY kerak.")
+async def subjects(q):
+ kb=[[InlineKeyboardButton(s,callback_data="sub|"+s)] for s in BANK]
+ kb.append([InlineKeyboardButton("⬅️ Menyu",callback_data="home")])
+ await q.edit_message_text("Fan tanlang:",reply_markup=InlineKeyboardMarkup(kb))
+async def cb(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+ q=u.callback_query;await q.answer();uid=q.from_user.id;ensure(uid)
+ if q.data in ("subjects","national"):await subjects(q)
+ elif q.data=="home":await q.edit_message_text("MUHA AI — bosh menyu",reply_markup=home())
+ elif q.data=="help":await q.edit_message_text("Buyruqlar: /start /mode /profile /reset /usage /redeem KOD\\nAI uchun OPENAI_API_KEY sozlang.",reply_markup=home())
+ elif q.data=="official":await q.edit_message_text("UZBMB rasmiy manbalari:\\nhttps://uzbmb.uz/page/milliytest\\nhttps://www.uzbmb.uz/page/namuna_m\\nhttps://www.uzbmb.uz/page/fanlar\\n\\nBot savollari rasmiy savollar emas.",reply_markup=home())
+ elif q.data=="profile":
+  with db() as c:
+   r=c.execute("SELECT credits,premium_until,score,total,daily_used FROM users WHERE uid=?",(uid,)).fetchone()
+   hist=c.execute("SELECT subject,correct,total FROM results WHERE uid=? ORDER BY id DESC LIMIT 5",(uid,)).fetchall()
+  await q.edit_message_text(f"Premium: {'faol' if active(r[1]) else 'faol emas'}\\nKredit: {r[0]}\\nNatija: {r[2]}/{r[3]}\\nBugungi bepul so‘rov: {r[4]}/{DAILY_LIMIT}\\n"+("\\nOxirgi testlar:\\n"+"\\n".join(f"{s}: {a}/{b}" for s,a,b in hist) if hist else ""),reply_markup=home())
+ elif q.data.startswith("sub|"):
+  s=q.data.split("|",1)[1];ctx.user_data.update(subject=s,items=random.sample(BANK[s],min(5,len(BANK[s]))),idx=0,correct=0)
+  await question(q,ctx)
+ elif q.data.startswith("answer|"):
+  _,choice,idx=q.data.split("|");idx=int(idx)
+  if idx!=ctx.user_data.get("idx",0):return
+  item=ctx.user_data["items"][idx]
+  if int(choice)==item[2]:ctx.user_data["correct"]+=1;msg="✅ To‘g‘ri!"
+  else:msg="❌ To‘g‘ri javob: "+item[1][item[2]]
+  ctx.user_data["idx"]+=1
+  await q.edit_message_text(msg+"\\n💡 "+item[3],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Keyingi ➡️",callback_data="next")]]))
+ elif q.data=="next":await question(q,ctx)
+async def question(q,ctx):
+ i=ctx.user_data["idx"];items=ctx.user_data["items"];s=ctx.user_data["subject"]
+ if i>=len(items):
+  n=ctx.user_data["correct"];total=len(items);uid=q.from_user.id
+  with db() as c:
+   c.execute("INSERT INTO results(uid,subject,correct,total,created_at) VALUES(?,?,?,?,?)",(uid,s,n,total,datetime.now(timezone.utc).isoformat()))
+   c.execute("UPDATE users SET score=score+?,total=total+? WHERE uid=?",(n,total,uid))
+  await q.edit_message_text(f"Test yakunlandi: {s}\\nNatija: {n}/{total}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Yana test",callback_data="subjects")],[InlineKeyboardButton("Profil",callback_data="profile")]]));return
+ text,opts,correct,ex=items[i]
+ await q.edit_message_text(f"🎓 {s} — {i+1}/{len(items)}\\n\\n{text}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{'ABCD'[j]}. {o}",callback_data=f"answer|{j}|{i}")] for j,o in enumerate(opts)]))
+async def ai_reply(text, image_url=None):
+ if not OPENAI_API_KEY:return "AI xizmatini yoqish uchun Railway Variables ichida OPENAI_API_KEY kiriting."
+ try:
+  from openai import OpenAI
+  client=OpenAI(api_key=OPENAI_API_KEY)
+  content=[{"type":"text","text":text}]
+  if image_url:content.append({"type":"image_url","image_url":{"url":image_url}})
+  r=client.chat.completions.create(model=AI_MODEL,messages=[{"role":"system","content":"You are MUHA AI, a helpful educational assistant. Reply in the user's language, explain steps clearly, and do not claim practice questions are official exam questions."},{"role":"user","content":content}],max_tokens=900)
+  return r.choices[0].message.content or "Javob bo‘sh qaytdi."
+ except Exception as e:
+  logging.exception("AI request failed")
+  return "AI xizmatida xatolik yuz berdi. API kaliti, balans va model sozlamalarini tekshiring."
+async def text_msg(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+ uid=u.effective_user.id
+ if not consume(uid):
+  await u.effective_message.reply_text(f"Bugungi bepul limit ({DAILY_LIMIT}) tugadi. Kredit kodini /redeem KOD orqali ishlating.");return
+ answer=await ai_reply(u.effective_message.text)
+ await u.effective_message.reply_text(answer)
+async def photo_msg(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+ if not consume(u.effective_user.id):
+  await u.effective_message.reply_text("Bugungi limit tugadi.");return
+ if not OPENAI_API_KEY:
+  await u.effective_message.reply_text("Rasm tahlili uchun OPENAI_API_KEY sozlang.");return
+ try:
+  photo=await u.effective_message.photo[-1].get_file()
+  import httpx
+  data=await photo.download_as_bytearray()
+  url="data:image/jpeg;base64,"+base64.b64encode(data).decode()
+  caption=u.effective_message.caption or "Rasmdagi topshiriqni o‘qib, o‘zbek tilida tushuntir."
+  await u.effective_message.reply_text(await ai_reply(caption,url))
+ except Exception:
+  logging.exception("Photo handler failed");await u.effective_message.reply_text("Rasmni tahlil qilishda xatolik yuz berdi.")
+async def voice_msg(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+ if not OPENAI_API_KEY:
+  await u.effective_message.reply_text("Ovozni matnga aylantirish uchun OPENAI_API_KEY sozlang.");return
+ try:
+  from openai import OpenAI
+  f=await u.effective_message.voice.get_file()
+  data=await f.download_as_bytearray()
+  client=OpenAI(api_key=OPENAI_API_KEY)
+  with tempfile.NamedTemporaryFile(suffix=".ogg") as tmp:
+   tmp.write(data);tmp.flush()
+   tr=client.audio.transcriptions.create(model=TRANSCRIBE_MODEL,file=open(tmp.name,"rb"))
+  await u.effective_message.reply_text("🎙 Tanilgan matn:\\n"+tr.text)
+  await u.effective_message.reply_text(await ai_reply(tr.text))
+ except Exception:
+  logging.exception("Voice handler failed");await u.effective_message.reply_text("Ovoz tahlilida xatolik. API sozlamalarini tekshiring.")
+async def mode(u,c):await u.effective_message.reply_text("Fan tanlang:",reply_markup=home())
+async def profile(u,c):
+ ensure(u.effective_user.id)
+ with db() as x:r=x.execute("SELECT credits,premium_until,score,total,daily_used FROM users WHERE uid=?",(u.effective_user.id,)).fetchone()
+ await u.effective_message.reply_text(f"Premium: {'faol' if active(r[1]) else 'faol emas'}\\nKredit: {r[0]}\\nNatija: {r[2]}/{r[3]}\\nBugungi ishlatilgan limit: {r[4]}")
+async def usage(u,c):await profile(u,c)
+async def reset(u,c):
+ ctx_user=u.effective_user.id
+ await u.effective_message.reply_text("Yangi suhbat boshlash uchun /start bosing. (Bu versiyada chat tarixi saqlanmaydi.)")
+async def makecode(u,c):
+ if u.effective_user.id not in ADMIN_IDS:await u.effective_message.reply_text("Faqat administrator uchun.");return
+ try:credits=int(c.args[0]) if c.args else PREMIUM_CREDITS;months=int(c.args[1]) if len(c.args)>1 else 5
+ except:await u.effective_message.reply_text("Format: /makecode 5000 5");return
+ code=os.urandom(5).hex().upper()
+ with db() as x:x.execute("INSERT INTO codes VALUES(?,?,?,?,?)",(code,credits,months,None,u.effective_user.id))
+ await u.effective_message.reply_text(f"Bir martalik kod: {code}\\nKredit: {credits}\\nPremium: {months} oy")
+async def redeem(u,c):
+ uid=u.effective_user.id;ensure(uid)
+ if not c.args:await u.effective_message.reply_text("Format: /redeem KOD");return
+ code=c.args[0].upper()
+ with db() as x:
+  row=x.execute("SELECT credits,months,used_by FROM codes WHERE code=?",(code,)).fetchone()
+  if not row or row[2] is not None:await u.effective_message.reply_text("Kod noto‘g‘ri yoki ishlatilgan.");return
+  credits,months,_=row;now=datetime.now(timezone.utc);old=x.execute("SELECT premium_until FROM users WHERE uid=?",(uid,)).fetchone()[0]
+  try:
+   olddt=datetime.fromisoformat(old) if old else now
+   if olddt>now:now=olddt
+  except:pass
+  m=now.month-1+months;y=now.year+m//12;m=m%12+1;d=min(now.day,calendar.monthrange(y,m)[1]);exp=now.replace(year=y,month=m,day=d).isoformat()
+  x.execute("UPDATE codes SET used_by=? WHERE code=?",(uid,code))
+  x.execute("UPDATE users SET credits=credits+?,premium_until=? WHERE uid=?",(credits,exp,uid))
+ await u.effective_message.reply_text(f"Kod qabul qilindi. {credits} kredit, Premium {months} oy. Tugash: {exp[:10]}")
+def main():
+ if not TOKEN:raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is missing")
+ a=Application.builder().token(TOKEN).build()
+ for cmd,fn in [("start",start),("help",help_cmd),("mode",mode),("profile",profile),("usage",usage),("reset",reset),("makecode",makecode),("redeem",redeem)]:a.add_handler(CommandHandler(cmd,fn))
+ a.add_handler(CallbackQueryHandler(cb))
+ a.add_handler(MessageHandler(filters.PHOTO,photo_msg))
+ a.add_handler(MessageHandler(filters.VOICE,voice_msg))
+ a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_msg))
+ a.run_polling()
+if __name__=="__main__":main()
